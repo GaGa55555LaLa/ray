@@ -215,6 +215,9 @@ class NixlTensorTransport(TensorTransportManager):
         # extract_tensor_transport_metadata. When None, all streams on each
         # device are synchronized instead.
         self._cuda_stream: Optional["torch.cuda.Stream"] = None
+        # The CUDA stream that wait_fetch_complete queues the receive pool's
+        # copies out on. When None, they are queued on the current stream.
+        self._receive_cuda_stream: Optional["torch.cuda.Stream"] = None
 
     def tensor_transport_backend(self) -> str:
         return "NIXL"
@@ -225,6 +228,13 @@ class NixlTensorTransport(TensorTransportManager):
         See :func:`ray.experimental.set_nixl_cuda_stream` for details.
         """
         self._cuda_stream = stream
+
+    def set_receive_cuda_stream(self, stream: Optional["torch.cuda.Stream"]) -> None:
+        """Sets the CUDA stream for copying received tensors out of the pool.
+
+        See :func:`ray.experimental.set_nixl_receive_cuda_stream` for details.
+        """
+        self._receive_cuda_stream = stream
 
     @staticmethod
     def is_one_sided() -> bool:
@@ -664,7 +674,10 @@ class NixlTensorTransport(TensorTransportManager):
                 # can overwrite, so copy them out before the caller sees them.
                 with self._defer_cleanup():
                     fetch_request.tensors = self._memory_pool.copy_out_and_free(
-                        fetch_request.tensors, blocks, fetch_request.pool_target_device
+                        fetch_request.tensors,
+                        blocks,
+                        fetch_request.pool_target_device,
+                        stream=self._receive_cuda_stream,
                     )
             return fetch_request.tensors
         except TimeoutError:

@@ -1,8 +1,10 @@
 """Unit tests for MemoryPoolManager and packed-layout wire contract.
 """
 
+import contextlib
 import random
 import sys
+import types
 
 import pytest
 import torch
@@ -574,39 +576,265 @@ class TestCopyOutAndFree:
 
         assert sum(b.size for b in pool._free_blocks) == 64
 
-    def test_syncs_before_freeing_when_a_copy_fails(self, monkeypatch):
-        """A failure partway through still has to wait for the queued copies.
-
-        Copies for earlier tensors are only ordered on the CUDA stream, so
-        freeing the block first would let the next NIXL transfer overwrite
-        memory they are still reading.
-        """
-        pool = MemoryPoolManager(pool_size=64, device=torch.device("cpu"))
-        regions, blocks = pool.allocate_regions([16])
-        # Take the CUDA path without a GPU: the copy fails on the bad target
-        # device before any real device work is queued.
-        pool.device = torch.device("cuda")
-
-        order = []
-        free_blocks = pool.free_blocks
-
-        def record_free(freed):
-            order.append("free")
-            free_blocks(freed)
-
-        monkeypatch.setattr(torch.cuda, "synchronize", lambda *_: order.append("sync"))
-        monkeypatch.setattr(pool, "free_blocks", record_free)
-
-        with pytest.raises(RuntimeError):
-            pool.copy_out_and_free(regions, blocks, target_device="not_a_device")
-
-        assert order == ["sync", "free"]
-        assert sum(b.size for b in pool._free_blocks) == 64
-
     def test_free_blocks_is_noop_for_empty_list(self):
         pool = MemoryPoolManager(pool_size=64, device=torch.device("cpu"))
         pool.free_blocks([])
         assert sum(b.size for b in pool._free_blocks) == 64
+
+
+# ---------------------------------------------------------------------------
+# Receive side: copy out of a GPU pool with lazy synchronization
+# ---------------------------------------------------------------------------
+
+
+class _FakeEvent:
+    """Stands in for torch.cuda.Event, logging what the pool does with it."""
+
+    def __init__(self, log):
+        self._log = log
+        self.done = False
+
+    def record(self, stream):
+        self._log.append(("record", stream))
+
+    def query(self):
+        return self.done
+
+    def synchronize(self):
+        self._log.append(("wait", self))
+        self.done = True
+
+
+class _FakeStream:
+    def __init__(self, device):
+        self.device = device
+
+
+@pytest.fixture
+def fake_cuda(monkeypatch):
+    """A CPU pool that takes the CUDA path, with the CUDA calls logged.
+
+    The pool reports a CUDA device so ``copy_out_and_free`` takes the GPU path,
+    while its memory stays on the CPU, so copies need an explicit CPU
+    ``target_device``. ``user_stream`` reports the pool tensor's device so it
+    passes the device check, and ``current_stream`` is what
+    ``torch.cuda.current_stream`` returns.
+    """
+    log = []
+    events = []
+
+    def make_event():
+        event = _FakeEvent(log)
+        events.append(event)
+        return event
+
+    @contextlib.contextmanager
+    def use_stream(stream):
+        log.append(("enter", stream))
+        yield
+        log.append(("exit", stream))
+
+    def no_device_sync(*_):
+        raise AssertionError("a copy out must not synchronize the whole device")
+
+    pool = MemoryPoolManager(pool_size=64, device=torch.device("cpu"))
+    pool.device = torch.device("cuda")
+    user_stream = _FakeStream(pool.get_pool_tensor().device)
+    current_stream = _FakeStream(pool.get_pool_tensor().device)
+
+    monkeypatch.setattr(torch.cuda, "Event", make_event)
+    monkeypatch.setattr(torch.cuda, "stream", use_stream)
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda *_: current_stream)
+    monkeypatch.setattr(torch.cuda, "synchronize", no_device_sync)
+
+    return types.SimpleNamespace(
+        pool=pool,
+        log=log,
+        events=events,
+        user_stream=user_stream,
+        current_stream=current_stream,
+    )
+
+
+def _waits(log):
+    return [entry[1] for entry in log if entry[0] == "wait"]
+
+
+# Each test runs with a stream passed in and with the default current stream.
+_with_and_without_stream = pytest.mark.parametrize("use_stream", [True, False])
+
+
+class TestLazyCopyOut:
+    @_with_and_without_stream
+    def test_copies_without_syncing(self, fake_cuda, use_stream):
+        pool, log = fake_cuda.pool, fake_cuda.log
+        stream = fake_cuda.user_stream if use_stream else None
+        regions, blocks = pool.allocate_regions([12])
+        regions[0].view(torch.float32).copy_(_make_tensor([1.0, 2.0, 3.0]))
+
+        copies = pool.copy_out_and_free(
+            [regions[0].view(torch.float32)], blocks, "cpu", stream=stream
+        )
+
+        assert torch.equal(copies[0], _make_tensor([1.0, 2.0, 3.0]))
+        # The event is recorded after the copies, on the stream they ran on,
+        # with no device-wide sync. A passed stream is made current for them.
+        if use_stream:
+            assert log == [("enter", stream), ("exit", stream), ("record", stream)]
+        else:
+            assert log == [("record", fake_cuda.current_stream)]
+        # The blocks are free right away, with the copy's event pending.
+        assert sum(b.size for b in pool._free_blocks) == 64
+        assert pool._pending_copy_outs == fake_cuda.events
+
+    @_with_and_without_stream
+    def test_next_receive_waits_for_the_copy(self, fake_cuda, use_stream):
+        pool = fake_cuda.pool
+        stream = fake_cuda.user_stream if use_stream else None
+        regions, blocks = pool.allocate_regions([16])
+        pool.copy_out_and_free(regions, blocks, "cpu", stream=stream)
+
+        pool.allocate_regions([16])
+
+        assert _waits(fake_cuda.log) == fake_cuda.events
+
+    @_with_and_without_stream
+    def test_next_send_waits_before_writing(self, fake_cuda, use_stream, monkeypatch):
+        pool, log = fake_cuda.pool, fake_cuda.log
+        stream = fake_cuda.user_stream if use_stream else None
+        regions, blocks = pool.allocate_regions([16])
+        pool.copy_out_and_free(regions, blocks, "cpu", stream=stream)
+
+        copy_into_pool = pool._copy_into_pool
+
+        def record_write(*args):
+            log.append(("write", None))
+            copy_into_pool(*args)
+
+        monkeypatch.setattr(pool, "_copy_into_pool", record_write)
+        pool.allocate_group("obj", [_make_tensor([1.0, 2.0])])
+
+        assert [entry[0] for entry in log][-2:] == ["wait", "write"]
+        assert _waits(log) == fake_cuda.events
+
+    def test_finished_copies_are_dropped(self, fake_cuda):
+        pool, events = fake_cuda.pool, fake_cuda.events
+        for _ in range(2):
+            regions, blocks = pool.allocate_regions([16])
+            pool.copy_out_and_free(regions, blocks, "cpu")
+            events[-1].done = True
+
+        # Only the latest copy is tracked; the finished one was dropped when
+        # the second copy freed its blocks.
+        assert pool._pending_copy_outs == [events[-1]]
+
+    @_with_and_without_stream
+    def test_records_event_when_a_copy_fails(self, fake_cuda, use_stream):
+        """Copies queued before the failure still read the blocks, so the
+        next allocation has to wait for them too."""
+        pool = fake_cuda.pool
+        stream = fake_cuda.user_stream if use_stream else None
+        regions, blocks = pool.allocate_regions([16])
+
+        with pytest.raises(RuntimeError):
+            pool.copy_out_and_free(regions, blocks, "not_a_device", stream=stream)
+
+        recorded_on = stream if use_stream else fake_cuda.current_stream
+        assert ("record", recorded_on) in fake_cuda.log
+        assert sum(b.size for b in pool._free_blocks) == 64
+        assert pool._pending_copy_outs == fake_cuda.events
+
+    def test_stream_on_another_device_raises_and_frees(self, fake_cuda):
+        pool = fake_cuda.pool
+        regions, blocks = pool.allocate_regions([16])
+
+        with pytest.raises(ValueError, match="Device mismatch"):
+            pool.copy_out_and_free(
+                regions, blocks, "cpu", stream=_FakeStream(torch.device("cuda", 1))
+            )
+
+        assert fake_cuda.log == []
+        assert sum(b.size for b in pool._free_blocks) == 64
+        assert pool._pending_copy_outs == []
+
+    @pytest.mark.parametrize(
+        "allocation, failing_step",
+        [("receive", "wait"), ("send", "wait"), ("send", "write")],
+    )
+    def test_failed_allocation_frees_its_blocks(
+        self, fake_cuda, monkeypatch, allocation, failing_step
+    ):
+        """If waiting for a pending copy (a CUDA error) or the send-side write
+        fails, the blocks just carved go back to the pool, since the caller
+        never gets them to free."""
+        pool = fake_cuda.pool
+        regions, blocks = pool.allocate_regions([16])
+        pool.copy_out_and_free(regions, blocks, "cpu")
+
+        def fail(*_):
+            raise RuntimeError("CUDA error")
+
+        if failing_step == "wait":
+            monkeypatch.setattr(fake_cuda.events[-1], "synchronize", fail)
+        else:
+            monkeypatch.setattr(pool, "_copy_into_pool", fail)
+
+        with pytest.raises(RuntimeError, match="CUDA error"):
+            if allocation == "receive":
+                pool.allocate_regions([16])
+            else:
+                pool.allocate_group("obj", [_make_tensor([1.0, 2.0])])
+
+        assert sum(b.size for b in pool._free_blocks) == 64
+        assert pool._allocated_by_obj == {}
+
+    def test_cpu_pool_uses_no_stream_or_event(self, fake_cuda):
+        pool = MemoryPoolManager(pool_size=64, device=torch.device("cpu"))
+        regions, blocks = pool.allocate_regions([12])
+        regions[0].view(torch.float32).copy_(_make_tensor([1.0, 2.0, 3.0]))
+
+        copies = pool.copy_out_and_free(
+            [regions[0].view(torch.float32)], blocks, stream=fake_cuda.user_stream
+        )
+
+        assert torch.equal(copies[0], _make_tensor([1.0, 2.0, 3.0]))
+        assert fake_cuda.log == []
+        assert pool._pending_copy_outs == []
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a GPU")
+@_with_and_without_stream
+def test_copy_out_survives_reuse_on_gpu(use_stream):
+    """On a real GPU, a lazily synchronized copy out keeps its data when the
+    next allocation reuses the block and it is overwritten off-stream."""
+    pool = MemoryPoolManager(pool_size=1 << 20, device=torch.device("cuda"))
+    stream = torch.cuda.Stream() if use_stream else None
+    copy_stream = stream or torch.cuda.current_stream()
+    expected = torch.arange(1 << 18, dtype=torch.float32, device="cuda")
+
+    regions, blocks = pool.allocate_regions([expected.numel() * 4])
+    regions[0].view(torch.float32).copy_(expected)
+    busy = torch.randn(4096, 4096, device="cuda")
+    torch.cuda.synchronize()
+
+    # Keep the copy's stream busy so the copy is still queued when the block
+    # is reused.
+    with torch.cuda.stream(copy_stream):
+        for _ in range(20):
+            busy = busy @ busy
+    copies = pool.copy_out_and_free(
+        [regions[0].view(torch.float32)], blocks, stream=stream
+    )
+    # The next allocation must wait for the copy. Overwrite the block from
+    # another stream, the way a NIXL transfer writes outside the copy's
+    # stream: without the wait, this would land first.
+    reused, reused_blocks = pool.allocate_regions([expected.numel() * 4])
+    assert reused_blocks[0].offset == blocks[0].offset
+    with torch.cuda.stream(torch.cuda.Stream()):
+        reused[0].fill_(0)
+
+    torch.cuda.synchronize()
+    assert torch.equal(copies[0], expected)
 
 
 if __name__ == "__main__":

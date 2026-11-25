@@ -1,8 +1,10 @@
 """Memory pool management for NIXL RDT optimization."""
 
+import contextlib
 import threading
 from typing import (
     TYPE_CHECKING,
+    Any,
     Dict,
     List,
     NamedTuple,
@@ -213,6 +215,9 @@ class MemoryPoolManager:
         self._free_blocks: List[MemoryBlock] = [MemoryBlock(offset=0, size=pool_size)]
         # Blocks allocated per object ID.
         self._allocated_by_obj: Dict[str, List[MemoryBlock]] = {}
+        # CUDA events of copies out that may still be reading freed blocks.
+        # Every allocation waits on them before its blocks are written to.
+        self._pending_copy_outs: List[Any] = []
 
     def get_pool_tensor(self) -> "torch.Tensor":
         """Get the underlying pool tensor.
@@ -332,6 +337,7 @@ class MemoryPoolManager:
             temp_free.sort(key=lambda b: b.offset)
             self._free_blocks = temp_free
             self._allocated_by_obj[obj_id] = blocks
+            copy_out_events = list(self._pending_copy_outs)
 
         regions = [
             self._pool_tensor[b.offset : b.offset + nbytes]
@@ -339,7 +345,14 @@ class MemoryPoolManager:
         ]
         # Safe outside the lock: obj_id owns these blocks now, so no other
         # thread can hand the same bytes out while they are being written.
-        self._copy_into_pool(tensors, sizes, pool_starts)
+        try:
+            for event in copy_out_events:
+                event.synchronize()
+            self._copy_into_pool(tensors, sizes, pool_starts)
+        except Exception:
+            # The caller never learns about this allocation, so release it.
+            self.free_object(obj_id)
+            raise
         return regions
 
     def _copy_into_pool(
@@ -430,7 +443,18 @@ class MemoryPoolManager:
             # Commit only after every region has been placed.
             temp_free.sort(key=lambda b: b.offset)
             self._free_blocks = temp_free
+            copy_out_events = list(self._pending_copy_outs)
 
+        # NIXL writes into the regions outside any CUDA stream, so a copy out
+        # that may still read these bytes has to finish on the host first.
+        # Waiting outside the lock keeps other allocations unblocked.
+        try:
+            for event in copy_out_events:
+                event.synchronize()
+        except Exception:
+            # The caller never gets these blocks to free, so free them here.
+            self.free_blocks(blocks)
+            raise
         regions = [
             self._pool_tensor[b.offset : b.offset + nbytes]
             for b, nbytes in zip(blocks, region_nbytes)
@@ -442,6 +466,7 @@ class MemoryPoolManager:
         tensors: List["torch.Tensor"],
         blocks: List[MemoryBlock],
         target_device: Optional[Union[str, "torch.device"]] = None,
+        stream: Optional["torch.cuda.Stream"] = None,
     ) -> List["torch.Tensor"]:
         """Copy pool-backed tensors into independent tensors and free their blocks.
 
@@ -455,32 +480,72 @@ class MemoryPoolManager:
             target_device: Device the copies should land on. Defaults to the
                 pool's own device. Staging through a pool on a different device
                 costs nothing extra, since the copy out happens either way.
+            stream: CUDA stream to queue the copies on. Defaults to the current
+                stream of the pool's device. Either way this returns without
+                waiting for the copies: work queued on that stream afterwards
+                is ordered after them, and the next allocation from the pool
+                waits for them on the host. Ignored for a CPU pool, whose
+                copies have finished by the time they return.
 
         Returns:
             One independently allocated tensor per input, in the same order.
+
+        Raises:
+            ValueError: If ``stream`` is on a different device than the pool.
+                The blocks are freed before this is raised.
         """
         import torch
 
         device = self.device if target_device is None else target_device
+        pool_on_cuda = self.device.type == "cuda"
+        if not pool_on_cuda:
+            stream = None
+        if stream is not None and stream.device != self._pool_tensor.device:
+            self.free_blocks(blocks)
+            raise ValueError(
+                "Device mismatch between the CUDA stream set via "
+                "ray.experimental.set_nixl_receive_cuda_stream and the NIXL "
+                f"memory pool: the stream is on device {stream.device}, but the "
+                f"pool is on device {self._pool_tensor.device}. The stream's "
+                "device must match the pool's."
+            )
+        copy_stream_ctx = (
+            contextlib.nullcontext() if stream is None else torch.cuda.stream(stream)
+        )
+        copy_out_event = None
         # The copies run without the pool lock. The blocks stay allocated until
-        # the free below, so no other thread can hand these bytes out while they
-        # are being read, and the device sync does not block every other
-        # allocation behind it.
+        # the free below, so no other thread can hand these bytes out before the
+        # copies are queued.
         try:
-            # copy=True because .to() is a no-op when the device already
-            # matches, which would keep the result aliasing the pool block we
-            # are about to hand back.
-            # TODO(#65828): Allow a user to specify a stream for the copies.
-            copies = [tensor.to(device, copy=True) for tensor in tensors]
+            with copy_stream_ctx:
+                # copy=True because .to() is a no-op when the device already
+                # matches, which would keep the result aliasing the pool block
+                # we are about to hand back.
+                copies = [tensor.to(device, copy=True) for tensor in tensors]
         finally:
             try:
-                if self.device.type == "cuda":
-                    # TODO(#65829): Synchronize lazily. The copy only has to
-                    # finish before the next NIXL transfer writes into the
-                    # block, not before this returns.
-                    torch.cuda.synchronize(self.device)
+                if pool_on_cuda:
+                    # The copies only have to finish before the next NIXL
+                    # transfer writes into the blocks, so mark their end with
+                    # an event for the next allocation to wait on instead of
+                    # synchronizing here. Record it even when a copy failed
+                    # partway, since the copies queued before it still read
+                    # the blocks.
+                    copy_out_event = torch.cuda.Event()
+                    copy_out_event.record(
+                        stream or torch.cuda.current_stream(self.device)
+                    )
             finally:
-                self.free_blocks(blocks)
+                if copy_out_event is None:
+                    self.free_blocks(blocks)
+                else:
+                    with self._lock:
+                        # Keep only the copies that may still be running.
+                        self._pending_copy_outs = [
+                            e for e in self._pending_copy_outs if not e.query()
+                        ]
+                        self._pending_copy_outs.append(copy_out_event)
+                        self._free_blocks_locked(blocks)
         return copies
 
     def free_blocks(self, blocks: List[MemoryBlock]) -> None:

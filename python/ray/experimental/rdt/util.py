@@ -316,6 +316,12 @@ def register_nixl_memory_pool(size: int, device: "torch.device") -> None:
     target buffers are used instead, the pool is bypassed and the traditional
     register/deregister path is used.
 
+    With a GPU pool, Ray queues the copies out on the current CUDA stream and
+    returns without waiting for them, so read the received tensors on that
+    stream, which is the default stream unless you changed it. To read them
+    on another stream, set it with
+    :func:`ray.experimental.set_nixl_receive_cuda_stream`.
+
     If the pool has insufficient space for an allocation,
     :class:`NixlOutOfMemoryError` is raised.
 
@@ -391,6 +397,68 @@ def set_nixl_cuda_stream(stream: Optional["torch.cuda.Stream"]) -> None:
     """
     nixl_transport = get_tensor_transport_manager("NIXL")
     nixl_transport.set_cuda_stream(stream)
+
+
+@PublicAPI(stability="alpha")
+def set_nixl_receive_cuda_stream(stream: Optional["torch.cuda.Stream"]) -> None:
+    """Sets the CUDA stream that received tensors are copied out of the pool on.
+
+    When an actor that registered a GPU memory pool with
+    :func:`ray.experimental.register_nixl_memory_pool` receives an RDT object
+    over NIXL, the tensors land in the pool and Ray copies them out into
+    independent tensors before handing them to the task. Ray queues those
+    copies on a CUDA stream and returns without waiting for them, which by
+    default is the current stream of the thread that fetches the object. Use
+    this function to queue them on the stream your actor computes on instead,
+    so the copies don't contend with other work on the default stream. Work you
+    queue on ``stream`` afterwards runs after the copies, so read the received
+    tensors on ``stream``, or synchronize with it before reading them on any
+    other stream. Ray waits for the copies only before the next transfer that
+    uses the pool.
+
+    The stream must be on the same device as the memory pool. It has no effect
+    when the pool is on the CPU, or for objects received without the pool, for
+    example into buffers set with
+    :func:`ray.experimental.set_target_for_ref`.
+
+    The stream applies to all subsequent receives on this actor until changed.
+    Calling this again overwrites the previous stream. Pass ``None`` to clear it
+    and go back to the current stream.
+
+    This is separate from :func:`ray.experimental.set_nixl_cuda_stream`, which
+    only affects creating RDT objects.
+
+    Args:
+        stream: The CUDA stream to copy received tensors out of the pool on, or
+            ``None`` to copy them on the current stream.
+
+    Example:
+
+        .. code-block:: python
+
+            import torch
+            import ray
+            from ray.experimental import (
+                register_nixl_memory_pool,
+                set_nixl_receive_cuda_stream,
+            )
+
+            @ray.remote(num_gpus=1, enable_tensor_transport=True)
+            class Learner:
+                def __init__(self):
+                    register_nixl_memory_pool(1024 * 1024 * 1024, torch.device("cuda"))
+                    # A long-lived stream this actor computes on.
+                    self.stream = torch.cuda.Stream()
+                    # Copy received tensors out of the pool on `self.stream`
+                    # instead of the default stream.
+                    set_nixl_receive_cuda_stream(self.stream)
+
+                def update(self, weight):
+                    with torch.cuda.stream(self.stream):
+                        return (weight * 2).sum().item()
+    """
+    nixl_transport = get_tensor_transport_manager("NIXL")
+    nixl_transport.set_receive_cuda_stream(stream)
 
 
 def create_empty_tensors_from_metadata(

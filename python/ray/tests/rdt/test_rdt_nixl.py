@@ -1436,6 +1436,80 @@ def test_set_nixl_cuda_stream(ray_start_regular):
     assert ray.get(dst_actor.sum.remote(ref2, "cuda")) == 30
 
 
+@pytest.mark.parametrize("ray_start_regular", [{"num_gpus": 2}], indirect=True)
+def test_set_nixl_receive_cuda_stream(ray_start_regular):
+    """Received tensors copied out of the pool on the receive stream are
+    valid when read on that stream, across receives that reuse the pool."""
+
+    @ray.remote(num_gpus=1, num_cpus=0, enable_tensor_transport=True)
+    class Src:
+        @ray.method(tensor_transport="nixl")
+        def produce(self, value):
+            return torch.full((1024,), value, dtype=torch.float32, device="cuda")
+
+    @ray.remote(num_gpus=1, num_cpus=0, enable_tensor_transport=True)
+    class Dst:
+        def __init__(self):
+            from ray.experimental import (
+                register_nixl_memory_pool,
+                set_nixl_receive_cuda_stream,
+            )
+
+            # Room for one object, so every receive reuses the same bytes.
+            register_nixl_memory_pool(4096, torch.device("cuda"))
+            self.stream = torch.cuda.Stream()
+            set_nixl_receive_cuda_stream(self.stream)
+
+        def sum(self, tensor):
+            with torch.cuda.stream(self.stream):
+                return tensor.sum().item()
+
+        def sum_on_current_stream(self, tensor):
+            return tensor.sum().item()
+
+        def clear(self):
+            from ray.experimental import set_nixl_receive_cuda_stream
+
+            set_nixl_receive_cuda_stream(None)
+
+    src = Src.remote()
+    dst = Dst.remote()
+    for value in range(1, 4):
+        ref = src.produce.remote(float(value))
+        assert ray.get(dst.sum.remote(ref)) == 1024 * value
+
+    # After clearing the stream, the copies run on the current stream, so
+    # read the tensor there.
+    ray.get(dst.clear.remote())
+    for value in range(5, 8):
+        ref = src.produce.remote(float(value))
+        assert ray.get(dst.sum_on_current_stream.remote(ref)) == 1024 * value
+
+
+@pytest.mark.parametrize("ray_start_regular", [{"num_gpus": 1}], indirect=True)
+def test_set_nixl_receive_cuda_stream_overwrite(ray_start_regular):
+    """Setting a receive stream overwrites any previous one, None clears it,
+    and it is independent of the stream set with set_nixl_cuda_stream."""
+    from ray.experimental.rdt.nixl_tensor_transport import (
+        NixlTensorTransport,
+    )
+
+    transport = NixlTensorTransport()
+    assert transport._receive_cuda_stream is None
+
+    stream1 = torch.cuda.Stream()
+    stream2 = torch.cuda.Stream()
+    transport.set_receive_cuda_stream(stream1)
+    assert transport._receive_cuda_stream is stream1
+    assert transport._cuda_stream is None
+
+    transport.set_receive_cuda_stream(stream2)
+    assert transport._receive_cuda_stream is stream2
+
+    transport.set_receive_cuda_stream(None)
+    assert transport._receive_cuda_stream is None
+
+
 @pytest.mark.parametrize("ray_start_regular", [{"num_gpus": 1}], indirect=True)
 def test_set_nixl_cuda_stream_overwrite(ray_start_regular):
     """Setting a stream overwrites any previous stream, and passing None
